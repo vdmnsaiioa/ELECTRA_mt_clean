@@ -2,7 +2,7 @@ import torch
 from ase import Atoms
 import numpy as np
 
-def grid2pos(mol: Atoms, grid_dict):
+def grid2pos(mol: Atoms, grid_dict, out_device="cpu"):
     """
     Convert a density grid to a position array efficiently.
 
@@ -48,8 +48,9 @@ def grid2pos(mol: Atoms, grid_dict):
         real_2d = frac_2d @ cell_t  # (nx*ny*nz, 3)
         pos_grid = real_2d.reshape(nx, ny, nz, 3)
 
-    # Return the final grid on CPU for general usage
-    return pos_grid.to("cpu")
+    # Return the final grid on CPU for general usage (or keep it on the GPU
+    # with out_device=..., which avoids a GPU->CPU->GPU round trip of ~7 MB).
+    return pos_grid.to(out_device)
 
 class LazyMeshGrid():
     def __init__(self, cell, grid_step, origin=None, adjust_grid_step=False):

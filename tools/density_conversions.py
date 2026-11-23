@@ -77,20 +77,46 @@ def check_number_of_electrons(sys: Atoms,
     return integrated_num_electrons
 
 
-def chgcar_to_cd(chgcar_file):
+# Decompressed bytes read when only the structure is needed. The header is
+# < 2 KB for QM9; the rest covers the grid lines that CustomVaspChargeDensity's
+# second read_vasp attempt looks at (it decides which files get skipped).
+_HEADER_ONLY_BYTES = 64 * 1024
+
+
+def chgcar_to_cd(chgcar_file, header_only=False):
+    """Read an .lz4 CHGCAR and return (density tensor, ase.Atoms).
+
+    The file is parsed in memory, with no temp file on the node's /tmp. The
+    density is converted with torch.from_numpy instead of
+    torch.FloatTensor(list), which gives the same float32 values about 5x faster.
+
+    header_only=True decompresses only the first ~64 KB (~48 KB read from disk
+    instead of ~8 MB) and returns (None, atoms). Use it when the density is not
+    needed, e.g. energy-only steps of use_fraction_of_density runs.
+    """
+    filecontent = read_chgcar_bytes(chgcar_file, header_only=header_only)
+    return chgcar_bytes_to_cd(filecontent, chgcar_file, header_only=header_only)
+
+
+def read_chgcar_bytes(chgcar_file, header_only=False):
+    """Decompressed CHGCAR bytes (I/O only, so it can run in a thread pool)."""
     with lz4.frame.open(chgcar_file, mode='rb') as fp:
-        filecontent = fp.read()
-    tmpfd, tmppath = tempfile.mkstemp(prefix="tmpchgcar")
-    with os.fdopen(tmpfd, "wb") as tmpfile:
-        tmpfile.write(filecontent)
-    vcd = CustomVaspChargeDensity(tmppath)
-    os.remove(tmppath)
+        return fp.read(_HEADER_ONLY_BYTES) if header_only else fp.read()
+
+
+def chgcar_bytes_to_cd(filecontent, chgcar_file, header_only=False):
+    """Parse bytes from read_chgcar_bytes; returns what chgcar_to_cd returns."""
+    text = filecontent.decode(errors="ignore") if header_only else filecontent.decode()
+    vcd = CustomVaspChargeDensity(None)
+    vcd.read_text(text, header_only=header_only)
     charge_density = vcd.chg
     try:
         atoms = vcd.atoms[0]
     except:
         print(f"No atoms in chgcar file {chgcar_file}")
-    cd = torch.FloatTensor(charge_density).squeeze(axis=0)
+    if header_only:
+        return None, atoms
+    cd = torch.from_numpy(np.asarray(charge_density, dtype=np.float32)).squeeze(axis=0)
     return cd, atoms
 
 def cd_to_chgcar_mat(original_file: str, atoms: Atoms, cd: np.array, filename: str):
@@ -99,8 +125,10 @@ def cd_to_chgcar_mat(original_file: str, atoms: Atoms, cd: np.array, filename: s
     tmpfd, tmppath = tempfile.mkstemp(prefix="tmpchgcar")
     with os.fdopen(tmpfd, "wb") as tmpfile:
         tmpfile.write(filecontent)
-    vcd = CustomVaspChargeDensity(tmppath)
-    os.remove(tmppath)
+    try:
+        vcd = CustomVaspChargeDensity(tmppath)
+    finally:
+        os.remove(tmppath)  # always clean up, even if parsing fails
     vcd.chg = [cd]
     vcd.atoms = [atoms]
     vcd.write(filename, format='chgcar')

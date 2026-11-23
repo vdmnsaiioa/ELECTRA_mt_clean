@@ -36,8 +36,8 @@ hotpp_outdim: 750
 master_units: 750
 use_l1_energy_features: False
 l1_energy_out_dim: 40
-initial_lr: 0.000004
-final_lr: 0.000004
+initial_lr: 4e-6
+final_lr: 4e-6
 n_warmups: 0
 clip_grad: False
 gradient_clip_value: 0.1
@@ -46,7 +46,7 @@ use_pos_disp_functions: True
 use_matrix_scalars: True
 gaus_per_electrons: 90
 loss_coef: 1
-data_split: "mp10%2025"
+data_split: "mpfull2025"
 lr_dec_every: 1
 lr_gamma: 0.8
 qm9_dens_path: /home/scratch3/jels/QM9_Full
@@ -78,7 +78,7 @@ relu: True
 energy_csv: /home/energy/s234633/ELECTRA/data_splits/energies.csv
 #rad_cosine_log_path: /home/energy/s234633/ELECTRA/glocks/cosine_similarity.csv
 
-seed: 505
+seed: 101
 n_train_points: 500000
 n_split_points: 500000
 n_split_points_single: 500000
@@ -105,8 +105,10 @@ gaus_pos_path_test: gaussian_positions/test/
 
 model_dir: /home/energy/s234633/ELECTRA/trained_models
 
-load_model: True
-load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-04-05_betazoid-canamar-100.model_state_dict
+load_model: False
+#load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-07-26_rare-music-389.model_state_dict
+#load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-07-20_upbeat-resonance-352.model_state_dict
+#load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-07-18_generous-mountain-350.model_state_dict
 #load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-03-13_wild-leaf-94.model_state_dict
 #load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-07-08_northern-surf-321.model_state_dict
 #load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-07-03_dulcet-dragon-285.model_state_dict
@@ -130,6 +132,9 @@ n_epochs: 1000
 real_batch_size: 1
 num_batches_before_update: 1
 eval_every: 1
+# False = no validation during training (no per-epoch val loop, no sanity check).
+# Weights are still saved every epoch; validate checkpoints with validate_mm.py.
+run_validation: False
 construct_test_cd: False
 construct_val_cd: True
 save_model: True

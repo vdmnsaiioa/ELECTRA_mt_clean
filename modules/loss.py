@@ -11,6 +11,12 @@ class DensityLoss:
         self.loss_type = config['loss_type']
         self.loss_coef = torch.tensor(config['loss_coef'], device=device)
         self.huber_loss_threshold = torch.tensor(config['huber_loss_threshold'], device=device)
+        # wandb "Density Loss" is logged every log_every_n_steps training calls
+        # (default 50) instead of every step: loss.item() synced the GPU on every
+        # step and wandb.log bypassed Lightning's throttling.
+        self.wandb_log_every = max(1, int(config.get("density_loss_log_every",
+                                                     config.get("log_every_n_steps", 50))))
+        self._n_train_calls = 0
 
     def compute_integrated_error(self, pred_cd, true_cd_tens, dv, n_valence_electrons, sampled_points=None):
         if sampled_points is None:
@@ -67,6 +73,8 @@ class DensityLoss:
             loss = integrated_error
 
         if self.use_wandb and training:
+            self._n_train_calls += 1
+        if self.use_wandb and training and self._n_train_calls % self.wandb_log_every == 0:
             wandb.log({
                 "Density Loss": loss.item(),
             })

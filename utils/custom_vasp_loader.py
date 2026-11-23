@@ -1,3 +1,4 @@
+import io
 import re
 import os
 import time
@@ -111,6 +112,58 @@ class CustomVaspChargeDensity:
             self.chg.append(charge_dens)
             self.atoms.append(atoms)
         fd.close()
+
+    def read_text(self, text, header_only=False):
+        """Same as ``read`` but parses an in-memory CHGCAR string.
+
+        Gives the same atoms, the same density array and the same exceptions as
+        ``read`` on a file with this content. It just skips the temp file.
+        The loop's second ``read_vasp`` attempt runs on the first grid-data
+        lines, exactly as in ``read``. That attempt raises the uncaught
+        "All three scaling factors must be positive" RuntimeError for the
+        known-bad QM9 files.
+
+        header_only=True parses the structure but not the grid (self.chg gets
+        None). ``text`` then only needs to hold the header plus some grid lines.
+        """
+        import ase.io.vasp as aiv
+        fd = io.StringIO(text, newline=None)  # universal newlines, like open()
+        self.atoms = []
+        self.chg = []
+        self.chgdiff = []
+        self.aug = ''
+        self.augdiff = ''
+        while True:
+            try:
+                atoms = aiv.read_vasp(fd)
+            except (IOError, ValueError, IndexError):
+                break
+            fd.readline()
+            ngr = fd.readline().split()
+            ng = (int(ngr[0]), int(ngr[1]), int(ngr[2]))
+            if header_only:
+                charge_dens = None
+            else:
+                chg = np.empty(ng)
+                charge_dens = self._read_chg_custom_text(text, chg, atoms)
+            self.chg.append(charge_dens)
+            self.atoms.append(atoms)
+
+    @staticmethod
+    def _read_chg_custom_text(text, chg, atoms):
+        """READ_CHG_CUSTOM on an in-memory string (same line skipping and parsing)."""
+        file = io.StringIO(text, newline=None)
+        volume = atoms.get_volume()
+        for _ in range(10 + len(atoms)):
+            next(file)
+        data_str = file.read()
+        end_pos = data_str.find("augmentation")
+        numeric_data_str = data_str[0:end_pos]
+        numeric_data = np.fromstring(numeric_data_str, sep=' ', dtype=np.float64)
+        chg = numeric_data.reshape((chg.shape[2], chg.shape[1], chg.shape[0]))
+        chg = np.transpose(chg, (2, 1, 0))
+        chg /= volume
+        return chg
 
     def _write_chg(self, fobj, chg, volume, format='chg'):
         """Write charge density

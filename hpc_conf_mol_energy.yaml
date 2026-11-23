@@ -28,18 +28,18 @@ pbc: False
 wrap: False
 r_max: 3
 weight_decay: 0
-energy_initial_lr: 0.000004
+energy_initial_lr: 0.00004
 energy_weight_decay: 0.0
 split_params: False
 energy_coef: 10
 hotpp_cutoff: 8
-hotpp_outdim: 100
-master_units: 100
+hotpp_outdim: 64
+master_units: 64
 use_l1_energy_features: False
 l1_energy_out_dim: 40
 #xyz_structures_dir: "/home/energy/s234633/ELECTRA/xyzfiles/xyzfiles" 
-initial_lr: 0.000004
-final_lr: 0.000004
+initial_lr: 0.00004
+final_lr: 0.00004
 n_warmups: 0
 clip_grad: False
 gradient_clip_value: 0.1
@@ -47,7 +47,7 @@ negative_contributions: True
 use_pos_disp_functions: True
 use_matrix_scalars: True
 gaus_per_electrons: 90
-data_split: "mp50%2025"
+data_split: "mpfull2025"
 lr_dec_every: 1
 lr_gamma: 0.8
 qm9_dens_path: /home/scratch3/jels/QM9_Full
@@ -106,8 +106,9 @@ gaus_pos_path_test: gaussian_positions/test/
 
 model_dir: /home/energy/s234633/ELECTRA/trained_models
 
-load_model: True
-load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-06-21_glowing-glade-251.model_state_dict
+load_model: False
+#load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-07-03_desert-firebrand-286.model_state_dict
+#load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-03-17_azure-breeze-96.model_state_dict
 #load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-05-30_cool-grass-196.model_state_dict
 #load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-06-01_wandering-vortex-198.model_state_dict
 #load_model_path: /home/energy/s234633/ELECTRA/trained_models/ELECTRA_2026-04-05_doctor-dukat-106.model_state_dict

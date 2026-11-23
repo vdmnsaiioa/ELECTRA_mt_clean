@@ -1,3 +1,5 @@
+# this model implements LayerNorm !!
+
 from __future__ import annotations
 
 import json
@@ -24,7 +26,7 @@ import ase
 from models.dists import gto, get_full_grid_dens, get_n_points_dens, get_n_points_dens_single
 from tools.ase_converter import Atoms2Graph
 from modules.grid2pos import grid2pos
-from tools.density_conversions import normalize_density, cd_to_chgcar_mat, cd_to_chgcar_mol, get_qm9_density, chgcar_to_cd
+from tools.density_conversions import normalize_density, cd_to_chgcar_mat, cd_to_chgcar_mol, get_qm9_density, chgcar_to_cd, read_chgcar_bytes, chgcar_bytes_to_cd
 from tools.graph_tools import CollateFuncAtoms
 from utils.train_helper_funcs import set_optimizer, load_csv_to_dict
 from modules.loss import DensityLoss
@@ -38,6 +40,29 @@ from ase.neighborlist import neighbor_list
 logger = logging.getLogger(__file__)
 BOHR_TO_ANGSTROM = 0.529177249
 HARTREE_TO_MEV = 27.2107 * 1000
+
+_VALENCE_BY_Z: dict[int, int] = {}
+
+
+def _valence_of_z(z: int) -> int:
+    """valence_electrons(chemical_symbols[z]), cached per element."""
+    v = _VALENCE_BY_Z.get(z)
+    if v is None:
+        v = _VALENCE_BY_Z[z] = valence_electrons(chemical_symbols[z])
+    return v
+
+
+def _to_device(tensors: dict, device) -> dict:
+    """Copy a dict of small CPU tensors to ``device`` without blocking the host.
+
+    A plain torch.tensor(np_array, device="cuda") copies from pageable memory,
+    and that waits for all queued GPU work. Pinned and non_blocking copies don't.
+    The values are the same.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return {k: v.to(device) for k, v in tensors.items()}
+    return {k: v.pin_memory().to(device, non_blocking=True) for k, v in tensors.items()}
 
 class ELECTRA(L.LightningModule, IOMixIn):
     __version__ = 1
@@ -202,21 +227,27 @@ class ELECTRA(L.LightningModule, IOMixIn):
         return f"batch_{batch_idx}"
 
     def _get_density_fraction_index(self, identifier: str | None) -> int | None:
-        if identifier is None:
-            return None
-        base = os.path.basename(identifier)
-        stem = base.split(".")[0]
-        try:
-            return int(stem)
-        except ValueError:
-            match = re.search(r"\d+", stem)
-            return int(match.group(0)) if match else None
+        return density_index_from_identifier(identifier)
 
     def _should_compute_training_density(self, identifier: str | None) -> bool:
         if not self.use_fraction_of_density:
             return True
         density_index = self._get_density_fraction_index(identifier)
         return density_index in self.indices_for_density
+
+    def _log_forward_time(self, dt):
+        """Log forward time once every `log_every_n_steps` calls (default 50).
+
+        Calling wandb.log/print on every step bypassed Lightning's throttling and
+        caused heavy I/O on the shared fileserver (Niflheim job kills, 2026-11-03).
+        """
+        self._fwd_time_calls = getattr(self, "_fwd_time_calls", 0) + 1
+        if self._fwd_time_calls % int(self.config.get("log_every_n_steps", 50)):
+            return
+        if self.config['wandb']:
+            wandb.log({"Forward Time": dt})
+        else:
+            print("Forward Time: ", dt)
 
     def forward(self,
                 atoms,
@@ -241,26 +272,34 @@ class ELECTRA(L.LightningModule, IOMixIn):
         wrap = self.config['wrap']
         idx_i, idx_j, offsets = neighbor_list("ijS", atoms, self.cutoff, self_interaction=False)
         offset = np.array(offsets) @ atoms.get_cell()
-        if not atoms.pbc.all():
-            offset = torch.zeros_like(torch.tensor(offset, dtype=self.precision, device=self.device))
-        data = {
-            "atomic_number": torch.tensor(atoms.numbers, dtype=torch.long, device=self.device),
-            "idx_i": torch.tensor(idx_i, dtype=torch.long, device=self.device),
-            "idx_j": torch.tensor(idx_j, dtype=torch.long, device=self.device),
-            "coordinate": torch.tensor(atoms.positions, dtype=self.precision, device=self.device),
-            "n_atoms": torch.tensor([len(atoms)], dtype=torch.long, device=self.device),
-            "offset": torch.tensor(offset, dtype=self.precision, device=self.device),
-            "scaling": torch.eye(3, dtype=self.precision, device=self.device).view(1, 3, 3),
-            "batch": torch.zeros(len(atoms), dtype=torch.long, device=self.device),
-            "cell": torch.tensor(atoms.cell[:], dtype=self.precision, device=self.device),
+        # Build every input on the CPU and copy it to the GPU in one go. The
+        # values match the old per-tensor torch.tensor(..., device=cuda) calls,
+        # which each blocked on the GPU.
+        if atoms.pbc.all():
+            offset_cpu = torch.tensor(offset, dtype=self.precision)
+        else:
+            offset_cpu = torch.zeros(np.shape(offset), dtype=self.precision)
+        data_cpu = {
+            "atomic_number": torch.tensor(atoms.numbers, dtype=torch.long),
+            "idx_i": torch.tensor(idx_i, dtype=torch.long),
+            "idx_j": torch.tensor(idx_j, dtype=torch.long),
+            "coordinate": torch.tensor(atoms.positions, dtype=self.precision),
+            "n_atoms": torch.tensor([len(atoms)], dtype=torch.long),
+            "offset": offset_cpu,
+            "scaling": torch.eye(3, dtype=self.precision).view(1, 3, 3),
+            "batch": torch.zeros(len(atoms), dtype=torch.long),
+            "cell": torch.tensor(atoms.cell[:], dtype=self.precision),
         }
-        at_numbers = data['atomic_number']
+        data = _to_device(data_cpu, self.device)
+        # Python flags so the backbone does not need a GPU->CPU sync to branch
+        # on the offsets (same values as offset.sum() != 0 / (offset != 0).sum() != 0).
+        data["_offset_sum_nonzero"] = bool(offset_cpu.sum() != 0)
+        data["_offset_any_nonzero"] = bool((offset_cpu != 0).sum() != 0)
         X_scal_full, X_vec_full, X_tens_full, init_emb = self.base_model(batch_data=data,
                                                                          properties=None,
                                                                           create_graph=False)
-        print('all shapes are here')
-        
-        atom_count = len(at_numbers)
+
+        atom_count = len(atoms)
         X_scal = X_scal_full[0]
         X_scal_vec = X_scal_full[1]
         X_scal_tens = X_scal_full[2]
@@ -273,15 +312,16 @@ class ELECTRA(L.LightningModule, IOMixIn):
         X_tens_vec = X_tens_full[1]
         X_tens = X_tens_full[2]
 
-        print(X_scal.shape, X_scal_vec.shape, X_scal_tens.shape, X_vec_scal.shape, X_vec.shape, X_vec_tens.shape, X_tens_scal.shape, X_tens_vec.shape, X_tens.shape)
 
-        valence_tensor = torch.tensor([valence_electrons(chemical_symbols[atom]) for atom in at_numbers], device=self.device)
+        # Valence counts from the CPU atomic numbers (the old loop over the CUDA
+        # tensor did one GPU->CPU sync per atom). Same values, same dtype.
+        valence_list = [_valence_of_z(int(z)) for z in atoms.numbers]
+        valence_cpu = torch.tensor(valence_list)
+        valence_tensor = _to_device({"v": valence_cpu}, self.device)["v"]
         #valence_tensor = torch.ones_like(valence_tensor, device=self.device)
         #valence_tensor = at_numbers
         scalar_features = X_scal.view(atom_count, -1)
-        print(scalar_features.shape,'before mapping to energy dim')
         scalar_features = self.map_to_energy_dim(scalar_features)
-        print(scalar_features.shape,'after mapping to energy dim')
 
         l1_scalar_features = None
         if self.use_l1_energy_features:
@@ -298,40 +338,35 @@ class ELECTRA(L.LightningModule, IOMixIn):
         # Compute the element-wise minimum between valence_tensor and fixed_value_tensor
         n_multiples = valence_tensor * self.units
         n_multiples = n_multiples.to(self.device)
-        atom_embeds = init_emb.repeat_interleave(valence_tensor, dim=0)
+        n_multiples_list = [v * self.units for v in valence_list]
 
         # Concatenate the selected slices along the first dimension
-        n_atoms = torch.sum(valence_tensor)
+        n_atoms = int(valence_cpu.sum())
+        atom_embeds = init_emb.repeat_interleave(valence_tensor, dim=0, output_size=n_atoms)
 
-        X_scal = self.slice(X_scal, n_multiples).view(n_atoms, self.units)
-        X_scal_vec = self.slice(X_scal_vec, n_multiples).view(n_atoms, self.units, 3)
-        X_scal_tens = self.slice(X_scal_tens, n_multiples).view(n_atoms, self.units, 3, 3)
+        X_scal = self.slice(X_scal, n_multiples_list).view(n_atoms, self.units)
+        X_scal_vec = self.slice(X_scal_vec, n_multiples_list).view(n_atoms, self.units, 3)
+        X_scal_tens = self.slice(X_scal_tens, n_multiples_list).view(n_atoms, self.units, 3, 3)
 
-        X_vec_scal = self.slice(X_vec_scal, n_multiples).view(n_atoms, self.units)
-        X_vec = self.slice(X_vec, n_multiples).view(n_atoms, self.units, 3)
-        X_vec_tens = self.slice(X_vec_tens, n_multiples).view(n_atoms, self.units, 3, 3)
+        X_vec_scal = self.slice(X_vec_scal, n_multiples_list).view(n_atoms, self.units)
+        X_vec = self.slice(X_vec, n_multiples_list).view(n_atoms, self.units, 3)
+        X_vec_tens = self.slice(X_vec_tens, n_multiples_list).view(n_atoms, self.units, 3, 3)
 
-        X_tens_scal = self.slice(X_tens_scal, n_multiples).view(n_atoms, self.units)
-        X_tens_vec = self.slice(X_tens_vec, n_multiples).view(n_atoms, self.units, 3)
-        X_tens = self.slice(X_tens, n_multiples).view(n_atoms, self.units, 3, 3)
+        X_tens_scal = self.slice(X_tens_scal, n_multiples_list).view(n_atoms, self.units)
+        X_tens_vec = self.slice(X_tens_vec, n_multiples_list).view(n_atoms, self.units, 3)
+        X_tens = self.slice(X_tens, n_multiples_list).view(n_atoms, self.units, 3, 3)
 
         pos_disp = X_vec.view(-1, 3)
         pos_disp_2 = X_scal_vec.view(-1, 3)
         pos_disp_3 = X_tens_vec.view(-1, 3)
         wsm_ = torch.cat((atom_embeds[:, :self.units], X_scal, X_vec_scal, X_tens_scal), dim=-1).view(n_atoms, -1)
-    
 
-        wsm2 = torch.cat((X_scal, X_vec_scal, X_tens_scal), dim=-1).view(n_atoms, -1)
-        # Compute determinants of l=2 tensor features
-        det_scal = torch.det(X_scal_tens.view(-1, 3, 3)).view(n_atoms, self.units)
-        det_vec = torch.det(X_vec_tens.view(-1, 3, 3)).view(n_atoms, self.units)
-        det_tens = torch.det(X_tens.view(-1, 3, 3)).view(n_atoms, self.units)
+        # (removed: wsm2, the three torch.det of the l=2 features and wsm_energy.
+        #  Their results were never used by any output or loss.)
 
         pos_scalars = self.pos_factors_network(wsm_)
         matrix_scalars = self.matrix_factors_network(wsm_)
         wsm = self.wsm_network(wsm_)
-        
-        wsm_energy = torch.cat((wsm_, det_scal, det_vec, det_tens), dim=-1)
         # guga
         weights_sm = torch.softmax(wsm[:, :self.units].reshape(n_atoms * self.units), dim=0)
         scal_mults_th = wsm[:, self.units:self.units * 2].reshape(n_atoms * self.units)
@@ -386,11 +421,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
             logger.warning("Non-finite values in pos_disp_final")
             print('Non-finite values in pos_disp_final')
 
-        pos_disp_features = torch.linalg.norm(pos_disp_final.view(n_atoms, self.units,3),dim=-1)
-
-        input_l0 = wsm_ # needs 4 on energy
-        input_l0l1 = torch.cat((input_l0, pos_disp_features), dim=-1) # needs 5 on energy
-        input_l0l1l2 = torch.cat((input_l0l1, det_scal, det_vec, det_tens), dim=-1) # needs 8 on energy
+        # (removed: pos_disp_features / input_l0* energy inputs; unused, see above)
 
         #norm_energy_input = self.energy_layer_norm(energy_input)
         phi_out = self.phi_network(energy_readout_input)
@@ -408,10 +439,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
                   }
 
         end = time.time()
-        if self.config['wandb']:
-            wandb.log({"Forward Time": end - start})
-        else:
-            print("Forward Time: ", end - start)
+        self._log_forward_time(end - start)
         return result
 
     def symm_tensor(self, matrix):
@@ -419,7 +447,28 @@ class ELECTRA(L.LightningModule, IOMixIn):
         return symm_matrix
 
     def slice(self, tensor, n_multiples):
-        return torch.cat([tensor[i, torch.arange(tensor.size(1))[:num_selections]] for i, num_selections in enumerate(n_multiples)])
+        """Concatenate tensor[i, :n_multiples[i]] over atoms i.
+
+        Same values (and gradients) as the old per-atom
+        torch.cat([tensor[i, arange(C)[:n_i]] for i ...]), but done as one gather
+        with a precomputed index. The old version did two GPU syncs per atom.
+        n_multiples may be a list of ints or a tensor.
+        """
+        if torch.is_tensor(n_multiples):
+            n_multiples = n_multiples.tolist()
+        n_rows, n_cols = tensor.shape[0], tensor.shape[1]
+        key = (tuple(n_multiples), n_cols, tensor.device)
+        cache = self.__dict__.setdefault("_slice_index_cache", {})
+        idx = cache.get(key)
+        if idx is None:
+            idx_np = np.concatenate([np.arange(min(int(n), n_cols), dtype=np.int64) + i * n_cols
+                                     for i, n in enumerate(n_multiples)])
+            idx = torch.from_numpy(idx_np).to(tensor.device)
+            if len(cache) > 8:
+                cache.clear()
+            cache[key] = idx
+        flat = tensor.reshape(n_rows * n_cols, *tensor.shape[2:])
+        return flat[idx]
 
     def construct_pos_def(self, matrix: torch.tensor):
         """
@@ -438,11 +487,20 @@ class ELECTRA(L.LightningModule, IOMixIn):
 
     def configure_optimizers(self):
         optimizer = set_optimizer(self, self.config)
-        anneal_milestones = list(self.config['lr_dec_every'] * np.arange(1, 500))
+        # Opt-in only (default off): same MultiStepLR as the disabled block below,
+        # lr = initial_lr * lr_gamma ** (epoch // lr_dec_every).
+        if self.config.get('use_lr_scheduler', False):
+            anneal_milestones = list(self.config['lr_dec_every'] * np.arange(1, 500))
+            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                                milestones=anneal_milestones,
+                                                                gamma=self.config['lr_gamma'])
+            return [optimizer], [lr_scheduler]
+        """anneal_milestones = list(self.config['lr_dec_every'] * np.arange(1, 500))
         lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                            milestones=anneal_milestones,
                                                           gamma=self.config['lr_gamma'])
-        return [optimizer], [lr_scheduler]
+        return [optimizer], [lr_scheduler]"""
+        return optimizer
 
     def _log_metrics(self, metrics: dict[str, tuple[torch.Tensor | float, bool]], *, batch_size: int = 1) -> None:
         """Log metrics once per step and once per epoch without double-counting.
@@ -488,7 +546,6 @@ class ELECTRA(L.LightningModule, IOMixIn):
 
     def on_train_epoch_end(self):
         self._save_model_checkpoint()
-        print('model saved haha')
 
     def on_train_epoch_start(self):
         opt = self.optimizers().optimizer
@@ -509,14 +566,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
         atom_count = rest[1] if len(rest) > 1 else None
         compute_density = self._should_compute_training_density(filename)
 
-        molecule_formula = qm9_mol.get_chemical_formula()
-        print(f"[Train] Step {batch_idx}: {molecule_formula}")
-        if self.use_fraction_of_density:
-            density_index = self._get_density_fraction_index(filename)
-            print(
-                f"[Train] Density fraction index={density_index} "
-                f"compute_density={compute_density}"
-            )
+        pass  # per-step print removed: flooded Slurm log on /home/energy (I/O kill)
 
         start = time.time()
         result = self(qm9_mol, n_elec=qm9_n_elec)
@@ -528,9 +578,8 @@ class ELECTRA(L.LightningModule, IOMixIn):
 
         if compute_density:
             if pos_grid is None:
-                pos_grid = grid2pos(qm9_mol, qm9_grid_dict)
-                pos_grid = pos_grid.to(self.device)
-            atom_positions = torch.tensor(qm9_mol.positions, device=self.device)
+                pos_grid = grid2pos(qm9_mol, qm9_grid_dict, out_device=self.device)
+            atom_positions = _to_device({"p": torch.tensor(qm9_mol.positions)}, self.device)["p"]
             cell = result['cell']
             weights = result['weights']
             pos_disp = result['pos_disp']
@@ -603,14 +652,9 @@ class ELECTRA(L.LightningModule, IOMixIn):
                 mol_volume=mol_volume,
             )
             density_loss = loss
-        else:
-            print(f"[Train] Skipping density prediction and density loss for {filename}")
 
         end = time.time()
-        if self.config['wandb']:
-            wandb.log({"Forward Time": end - start})
-        else:
-            print("Forward Time: ", end - start)
+        self._log_forward_time(end - start)
 
         energy_loss = None
         mae = None
@@ -620,12 +664,11 @@ class ELECTRA(L.LightningModule, IOMixIn):
         nrmse = None
         nrmse_mev = None
         nl1 = None
-        print(filename)
         if energy is None:
             print('not good')
         if energy is not None and atom_count is not None:
-            target_energy = torch.tensor(energy, dtype=result['energy'].dtype, device=self.device)
-            atom_count_t = torch.tensor(atom_count, dtype=result['energy'].dtype, device=self.device)
+            target_energy = torch.full((), energy, dtype=result['energy'].dtype, device=self.device)
+            atom_count_t = torch.full((), atom_count, dtype=result['energy'].dtype, device=self.device)
             base_mse = self.energy_loss_fn(result['energy'], target_energy)
             energy_loss = base_mse
 
@@ -638,7 +681,6 @@ class ELECTRA(L.LightningModule, IOMixIn):
             nl1 = torch.abs(result['energy'] - target_energy) / atom_count_t
             if compute_density:
                 loss = loss * self.density_coef + energy_loss * self.energy_coef
-                print('all good')
             else:
                 loss = energy_loss * self.energy_coef
         elif not compute_density:
@@ -652,8 +694,9 @@ class ELECTRA(L.LightningModule, IOMixIn):
             "Train Total Loss": (total_loss, False),
         }
         if density_loss is not None:
-            np_err = np.round(100 * dens_error.detach().cpu().numpy(), 3)
+            np_err = torch.round(100 * dens_error.detach(), decimals=3)
             if self.config['crystal']:
+                np_err = np_err.cpu().numpy()
                 cell = qm9_mol.get_cell()
                 cell_t = torch.tensor(cell, dtype=torch.float, device=self.device)  # shape (3,3)
                 tol = 1e-8
@@ -694,13 +737,11 @@ class ELECTRA(L.LightningModule, IOMixIn):
         energy = rest[0] if len(rest) > 0 else None
         atom_count = rest[1] if len(rest) > 1 else None
 
-        molecule_formula = qm9_mol.get_chemical_formula()
-        print(f"[Validation] Step {batch_idx}: {molecule_formula}")
+        pass  # per-step print removed: flooded Slurm log on /home/energy (I/O kill)
 
         if pos_grid is None:
-            pos_grid = grid2pos(qm9_mol, qm9_grid_dict)
-            pos_grid = pos_grid.to(self.device)
-        atom_positions = torch.tensor(qm9_mol.positions, device=self.device)
+            pos_grid = grid2pos(qm9_mol, qm9_grid_dict, out_device=self.device)
+        atom_positions = _to_device({"p": torch.tensor(qm9_mol.positions)}, self.device)["p"]
         start = time.time()
         result = self(qm9_mol, n_elec=qm9_n_elec)
         cell = result['cell']
@@ -759,10 +800,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
                                                    points=sampled_points,
                                                    mol_volume=mol_volume)
         end = time.time()
-        if self.config['wandb']:
-            wandb.log({"Forward Time": end - start})
-        else:
-            print("Forward Time:", end - start)
+        self._log_forward_time(end - start)
 
         loss, density_error = self.loss.compute_total_loss(
             sys=qm9_mol,
@@ -785,8 +823,8 @@ class ELECTRA(L.LightningModule, IOMixIn):
         nl1 = None
         density_loss = loss
         if energy is not None and atom_count is not None:
-            target_energy = torch.tensor(energy, dtype=result['energy'].dtype, device=self.device)
-            atom_count_t = torch.tensor(atom_count, dtype=result['energy'].dtype, device=self.device)
+            target_energy = torch.full((), energy, dtype=result['energy'].dtype, device=self.device)
+            atom_count_t = torch.full((), atom_count, dtype=result['energy'].dtype, device=self.device)
             base_mse = self.energy_loss_fn(result['energy'], target_energy)
             energy_loss = base_mse
             mae = torch.abs(result['energy'] - target_energy)
@@ -800,7 +838,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
 
         total_loss = loss.detach()
 
-        np_err = np.round(100 * density_error.detach().cpu().numpy(), 3)
+        np_err = torch.round(100 * density_error.detach(), decimals=3)
         metrics = {
             "Validation Density Err %": (np_err, True),
             "Validation Density Loss": (density_loss.detach(), False),
@@ -826,6 +864,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
 #            self.model_handler.save(self)
 
         if self.config['construct_val_cd'] and batch_idx % 100 == 0:
+            np_err = np_err.cpu().numpy()  # used in the plot filename below
             construct = True
             if construct:
                 qm9_path = os.path.join(self.qm9_dens_path, mol_cd_file)
@@ -968,13 +1007,11 @@ class ELECTRA(L.LightningModule, IOMixIn):
         energy = rest[0] if len(rest) > 0 else None
         atom_count = rest[1] if len(rest) > 1 else None
 
-        molecule_formula = qm9_mol.get_chemical_formula()
-        print(f"[Test] Step {batch_idx}: {molecule_formula}")
+        pass  # per-step print removed: flooded Slurm log on /home/energy (I/O kill)
 
         if pos_grid is None:
-            pos_grid = grid2pos(qm9_mol, qm9_grid_dict)
-            pos_grid = pos_grid.to(self.device)
-        atom_positions = torch.tensor(qm9_mol.positions, self.device)
+            pos_grid = grid2pos(qm9_mol, qm9_grid_dict, out_device=self.device)
+        atom_positions = _to_device({"p": torch.tensor(qm9_mol.positions)}, self.device)["p"]
         start = time.time()
         result = self(qm9_mol, n_elec=qm9_n_elec)
         cell = result['cell']
@@ -1031,10 +1068,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
                                                    mol_volume=mol_volume)
         end = time.time()
 
-        if self.config['wandb']:
-            wandb.log({"Forward Time": end - start})
-        else:
-            print("Forward Time: ", end - start)
+        self._log_forward_time(end - start)
         loss, density_error = self.loss.compute_total_loss(
             sys=qm9_mol,
             pred_cd=density,
@@ -1056,8 +1090,8 @@ class ELECTRA(L.LightningModule, IOMixIn):
         nl1 = None
         density_loss = loss
         if energy is not None and atom_count is not None:
-            target_energy = torch.tensor(energy, dtype=result['energy'].dtype, device=self.device)
-            atom_count_t = torch.tensor(atom_count, dtype=result['energy'].dtype, device=self.device)
+            target_energy = torch.full((), energy, dtype=result['energy'].dtype, device=self.device)
+            atom_count_t = torch.full((), atom_count, dtype=result['energy'].dtype, device=self.device)
             base_mse = self.energy_loss_fn(result['energy'], target_energy)
             energy_loss = base_mse
 
@@ -1384,6 +1418,33 @@ class ELECTRA(L.LightningModule, IOMixIn):
         }
         return loader_kwargs
 
+    def _eval_loader_kwargs(self):
+        """Validation/test loader settings.
+
+        These used num_workers=0, so the GPU sat idle while every file was read
+        (~0.3 s from scratch3) and parsed: about 3 h of each mpfull epoch went to
+        the 10k-molecule validation. QM9Dataset is a map-style dataset with a
+        sequential sampler, so worker processes return the batches in the same
+        order. config['eval_num_workers'] = 0 restores the old behaviour.
+        """
+        default_workers = max(1, min(6, _usable_cpus() - 2))
+        num_workers = max(0, int(self.config.get("eval_num_workers", default_workers)))
+        kwargs = {
+            "batch_size": 1,
+            "shuffle": False,
+            "collate_fn": collate_fn,
+            "pin_memory": True,
+            "num_workers": num_workers,
+        }
+        if num_workers > 0:
+            kwargs.update({
+                "worker_init_fn": _dl_worker_init,
+                "multiprocessing_context": "spawn",
+                "persistent_workers": True,
+                "prefetch_factor": int(self.config.get("eval_prefetch_factor", 2)),
+            })
+        return kwargs
+
     def train_dataloader(self):
         """Build the training dataloader without triggering density-specific work."""
         if self.config['MD_Data']:
@@ -1444,14 +1505,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
             self.config,
         )
 
-        return DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=False,
-            collate_fn=collate_fn,
-            pin_memory=True,
-            num_workers=0,
-        )
+        return DataLoader(dataset, **self._eval_loader_kwargs())
 
     def test_dataloader(self):
         if self.config['MD_Data']:
@@ -1465,11 +1519,7 @@ class ELECTRA(L.LightningModule, IOMixIn):
                               num_workers=0)
 
         return DataLoader(QM9Dataset(self.test_files, self.qm9_dens_path, self.config),
-                          batch_size=1,
-                          shuffle=False,
-                          collate_fn=collate_fn,
-                          pin_memory=True,
-                          num_workers=0)
+                          **self._eval_loader_kwargs())
 
     def plot_gaussian_positions(self,
                                 atom_types,
@@ -1743,9 +1793,15 @@ def _lookup_energy_info(
     return energy_value, atom_count_value
 
 
-def get_density(path: str):
-    """Load a compressed CHGCAR density file and derive metadata."""
-    density, structure = chgcar_to_cd(path)
+def get_density(path: str, raw: bytes | None = None):
+    """Load a compressed CHGCAR density file and derive metadata.
+
+    raw: the file's decompressed bytes if they were already read (prefetch).
+    """
+    if raw is None:
+        density, structure = chgcar_to_cd(path)
+    else:
+        density, structure = chgcar_bytes_to_cd(raw, path)
     if structure is None:
         raise ValueError(f"No atomic structure found in {path}")
 
@@ -1756,6 +1812,70 @@ def get_density(path: str):
     }
     n_elec = valence_electrons(structure.get_chemical_formula())
     return density, structure, n_elec, grid_dict
+
+
+def get_structure(path: str, raw: bytes | None = None):
+    """Like get_density but reads only the CHGCAR header: (None, atoms, n_elec, None).
+
+    For training structures without density supervision (use_fraction_of_density),
+    which only need the atoms and the energy. Reads ~48 KB instead of ~8 MB.
+    It raises/skips exactly the files get_density skips (see read_text).
+    """
+    if raw is None:
+        _, structure = chgcar_to_cd(path, header_only=True)
+    else:
+        _, structure = chgcar_bytes_to_cd(raw, path, header_only=True)
+    if structure is None:
+        raise ValueError(f"No atomic structure found in {path}")
+    n_elec = valence_electrons(structure.get_chemical_formula())
+    return None, structure, n_elec, None
+
+
+def density_index_from_identifier(identifier: str | None) -> int | None:
+    """File stem as an int (e.g. .../012345.CHGCAR.lz4 -> 12345)."""
+    if identifier is None:
+        return None
+    base = os.path.basename(identifier)
+    stem = base.split(".")[0]
+    try:
+        return int(stem)
+    except ValueError:
+        match = re.search(r"\d+", stem)
+        return int(match.group(0)) if match else None
+
+
+def _usable_cpus() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+def _iter_prefetched(paths, header_only_flags, n_threads, lookahead):
+    """Yield (path, header_only, future) in the given order. Each future holds
+    the file's decompressed bytes and is read up to ``lookahead`` files ahead
+    by ``n_threads`` threads. File reads (NFS) dominate loading time and release
+    the GIL, so this keeps the order but overlaps the reads.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import deque as _deque
+    if n_threads <= 0:
+        for p, h in zip(paths, header_only_flags):
+            yield p, h, None
+        return
+    with ThreadPoolExecutor(max_workers=n_threads) as ex:
+        pending = _deque()
+        it = iter(zip(paths, header_only_flags))
+        for p, h in it:
+            pending.append((p, h, ex.submit(read_chgcar_bytes, p, h)))
+            if len(pending) >= lookahead:
+                break
+        while pending:
+            p, h, fut = pending.popleft()
+            nxt = next(it, None)
+            if nxt is not None:
+                pending.append((nxt[0], nxt[1], ex.submit(read_chgcar_bytes, nxt[0], nxt[1])))
+            yield p, h, fut
 
 
 class DensityDataset(Dataset):
@@ -1818,6 +1938,20 @@ class DensityStream(IterableDataset):
         self.ood_name = ood_name
         self.shuffle_each_epoch = shuffle_each_epoch
         self.energy_dict, self.atom_count_dict = _load_energy_metadata(config)
+        # With use_fraction_of_density, structures outside indices_for_density
+        # never use their density (training_step skips it), so only their
+        # header is read. Set config['stream_header_only_without_density']=False
+        # to always read the full file.
+        self.use_fraction_of_density = bool(config.get('use_fraction_of_density', False))
+        self.indices_for_density = {int(idx) for idx in config.get('indices_for_density', [])}
+        self.header_only_without_density = bool(config.get('stream_header_only_without_density', True))
+        self.io_threads = int(config.get('stream_io_threads', 4))
+        self.io_lookahead = int(config.get('stream_io_lookahead', 8))
+
+    def _header_only(self, cd_file):
+        if not (self.use_fraction_of_density and self.header_only_without_density):
+            return False
+        return density_index_from_identifier(cd_file) not in self.indices_for_density
 
     def __len__(self):
         return len(self.file_list)
@@ -1838,10 +1972,16 @@ class DensityStream(IterableDataset):
             yield from self._iter_files(files[start:end])
 
     def _iter_files(self, files):
-        for cd_file in files:
-            path = _resolve_density_path(self.dens_path, cd_file)
+        paths = [_resolve_density_path(self.dens_path, f) for f in files]
+        flags = [self._header_only(f) for f in files]
+        prefetched = _iter_prefetched(paths, flags, self.io_threads, self.io_lookahead)
+        for cd_file, (path, header_only, fut) in zip(files, prefetched):
             try:
-                density, structure, n_elec, grid_dict = get_density(path)
+                raw = fut.result() if fut is not None else None
+                if header_only:
+                    density, structure, n_elec, grid_dict = get_structure(path, raw)
+                else:
+                    density, structure, n_elec, grid_dict = get_density(path, raw)
                 energy, atom_count = _lookup_energy_info(
                     cd_file,
                     self.energy_dict,

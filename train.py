@@ -1,3 +1,4 @@
+import os
 import argparse
 import warnings
 import yaml
@@ -7,7 +8,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch import seed_everything
 
 from utils.model_handling import ModelIO, get_tag
-from utils.train_helper_funcs import set_all_seeds, set_all_paths, get_files
+from utils.train_helper_funcs import set_all_seeds, set_all_paths, get_files, add_run_override_args, apply_run_overrides, get_run_name_prefix
 from utils.eq_check import equivariance_check
 from models.electra_hotpp.ELECTRA_energy import ELECTRA
 
@@ -51,6 +52,8 @@ def parse_args():
                            help="Disable positional displacement functions (overrides config).")
     parser.set_defaults(use_pos_disp_functions=None)
 
+    add_run_override_args(parser)
+
     return parser.parse_args()
 
 
@@ -71,6 +74,8 @@ def apply_overrides(config: dict, args: argparse.Namespace) -> dict:
         config["lr_gamma"] = args.lr_gamma
     if args.load_model is not None:
         config["load_model"] = args.load_model
+
+    config = apply_run_overrides(config, args)
 
     return config
 
@@ -96,8 +101,6 @@ def load_base_config() -> dict:
             config = yaml.safe_load(open("config_md.yaml"))
 
     config = yaml.safe_load(open(f"{base_path}/hpc_conf_mol_energy.yaml"))
-    print(config)
-
     return config
 
 
@@ -105,6 +108,7 @@ def run():
     args = parse_args()
     config = load_base_config()
     config = apply_overrides(config, args)
+    print(config)
 
     # Seed alignment
     set_all_seeds(config['seed'])
@@ -123,12 +127,14 @@ def run():
         logger=WandbLogger(
             config=config,
             project=config["project_name"],
+            save_dir=os.environ.get("WANDB_DIR", "."),  # WandbLogger default "." overrides WANDB_DIR
             log_model=True,
             group=f"Split_{config['data_split']}"
         ) if config.get('wandb', False) else None,
         check_val_every_n_epoch=config['eval_every'],
         #val_check_interval=val_check_interval,
-        log_every_n_steps=1,
+        log_every_n_steps=config.get("log_every_n_steps", 50),
+        enable_progress_bar=False,
         max_epochs=config['max_epochs'],
         gradient_clip_val=(config['gradient_clip_value'] if config.get('clip_grad', False) else None),
         gradient_clip_algorithm='value',
@@ -137,7 +143,9 @@ def run():
 
     # WandB naming and paths
     if config.get('wandb', False):
-        wb_name = trainer.logger.experiment.name
+        run = trainer.logger.experiment
+        run.name = f"{get_run_name_prefix(config, multitask=False)}_{run.name or run.id}"
+        wb_name = run.name
         tag = get_tag(wb_name)
     else:
         wb_name = None

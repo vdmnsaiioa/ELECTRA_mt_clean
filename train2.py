@@ -1,3 +1,4 @@
+import os
 import argparse
 import warnings
 import yaml
@@ -7,7 +8,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch import seed_everything
 
 from utils.model_handling import ModelIO, get_tag
-from utils.train_helper_funcs import set_all_seeds, set_all_paths, get_files
+from utils.train_helper_funcs import set_all_seeds, set_all_paths, get_files, add_run_override_args, apply_run_overrides, get_run_name_prefix
 from utils.eq_check import equivariance_check
 from models.electra_hotpp.ELECTRA_mm import ELECTRA
 
@@ -35,6 +36,8 @@ def parse_args():
                         help="Override the final learning rate.")
     parser.add_argument("--lr_gamma", type=float, default=None,
                         help="Override the lr gamma")
+    parser.add_argument("--use_lr_scheduler", action="store_true", default=None,
+                        help="Turn on the MultiStepLR scheduler (lr *= lr_gamma every lr_dec_every epochs). Off by default.")
 
     load_model_group = parser.add_mutually_exclusive_group()
     load_model_group.add_argument("--load_model", dest="load_model", action="store_true",
@@ -50,6 +53,8 @@ def parse_args():
     pos_group.add_argument("--no_use_pos_disp_functions", dest="use_pos_disp_functions", action="store_false",
                            help="Disable positional displacement functions (overrides config).")
     parser.set_defaults(use_pos_disp_functions=None)
+
+    add_run_override_args(parser)
 
     return parser.parse_args()
 
@@ -69,8 +74,12 @@ def apply_overrides(config: dict, args: argparse.Namespace) -> dict:
         config["use_pos_disp_functions"] = args.use_pos_disp_functions
     if args.lr_gamma is not None:
         config["lr_gamma"] = args.lr_gamma
+    if args.use_lr_scheduler is not None:
+        config["use_lr_scheduler"] = args.use_lr_scheduler
     if args.load_model is not None:
         config["load_model"] = args.load_model
+
+    config = apply_run_overrides(config, args)
 
     return config
 
@@ -96,8 +105,6 @@ def load_base_config() -> dict:
             config = yaml.safe_load(open("config_md.yaml"))
 
     config = yaml.safe_load(open(f"{base_path}/hpc_conf_mol_mm.yaml"))
-    print(config)
-
     return config
 
 
@@ -106,6 +113,11 @@ def run():
     args = parse_args()
     config = load_base_config()
     config = apply_overrides(config, args)
+    # Optional: put validation/test outputs (CHGCARs, deltas, HTML plots) somewhere
+    # other than /home/energy, e.g. scratch3. Heavy writes there get jobs killed.
+    if os.environ.get("ELECTRA_OUTPUT_BASE"):
+        config['niflheim_base_path'] = os.environ["ELECTRA_OUTPUT_BASE"].rstrip("/") + "/"
+    print(config)
 
     # Seed alignment
     set_all_seeds(config['seed'])
@@ -117,6 +129,7 @@ def run():
     # Short test timeout
     max_time = "0:02:30:00" if config['data_split'] == 'test' else config['max_time']
     #val_check_interval = config.get("val_check_interval")
+    run_validation = config.get("run_validation", True)
 
     trainer = L.Trainer(
         accelerator=accel,
@@ -124,21 +137,33 @@ def run():
         logger=WandbLogger(
             config=config,
             project=config["project_name"],
+            save_dir=os.environ.get("WANDB_DIR", "."),  # WandbLogger default "." overrides WANDB_DIR
             log_model=True,
             group=f"Split_{config['data_split']}"
         ) if config.get('wandb', False) else None,
         check_val_every_n_epoch=config['eval_every'],
+        # run_validation False: skip the per-epoch val loop and the startup sanity check.
+        limit_val_batches=None if run_validation else 0,
+        num_sanity_val_steps=None if run_validation else 0,
         #val_check_interval=val_check_interval,
-        log_every_n_steps=1,
+        log_every_n_steps=config.get("log_every_n_steps", 50),
+        enable_progress_bar=False,
         max_epochs=config['max_epochs'],
         gradient_clip_val=(config['gradient_clip_value'] if config.get('clip_grad', False) else None),
         gradient_clip_algorithm='value',
         max_time=max_time,
+        # No Lightning .ckpt (11.6 GB/epoch incl. optimizer state); weights are
+        # still saved every epoch by ModelIO to config['model_dir'].
+        enable_checkpointing=False,
     )
 
     # WandB naming and paths
     if config.get('wandb', False):
-        wb_name = trainer.logger.experiment.name
+        run = trainer.logger.experiment
+        run.name = f"{get_run_name_prefix(config, multitask=True)}_{run.name or run.id}"
+        if os.environ.get("RUN_NAME_TAG"):  # e.g. RUN_NAME_TAG=test for short debug jobs
+            run.name = f"{os.environ['RUN_NAME_TAG']}_{run.name}"
+        wb_name = run.name
         tag = get_tag(wb_name)
     else:
         wb_name = None
@@ -154,7 +179,7 @@ def run():
     electra = ELECTRA(
         train_files=train_files,
         test_files=test_files,
-        validation_files=test_files,
+        validation_files=validation_files,
         model_handler=model_handler,
         config=config,
     )
@@ -165,7 +190,7 @@ def run():
 
     # DataLoaders and seed workers
     train_loader = electra.train_dataloader()
-    val_loader = electra.val_dataloader()
+    val_loader = electra.val_dataloader() if run_validation else None
     test_loader = electra.test_dataloader()
     seed_everything(config['seed'], workers=True)
 

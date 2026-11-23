@@ -78,8 +78,10 @@ def chgcar_to_cd(chgcar_file):
     tmpfd, tmppath = tempfile.mkstemp(prefix="tmpchgcar")
     with os.fdopen(tmpfd, "wb") as tmpfile:
         tmpfile.write(filecontent)
-    vcd = CustomVaspChargeDensity(tmppath)
-    os.remove(tmppath)
+    try:
+        vcd = CustomVaspChargeDensity(tmppath)
+    finally:
+        os.remove(tmppath)  # always clean up, even if parsing fails
     charge_density = vcd.chg
     try:
         atoms = vcd.atoms[0]
@@ -94,8 +96,10 @@ def cd_to_chgcar_new(original_file: str, atoms: Atoms, cd: np.array, filename: s
     tmpfd, tmppath = tempfile.mkstemp(prefix="tmpchgcar")
     with os.fdopen(tmpfd, "wb") as tmpfile:
         tmpfile.write(filecontent)
-    vcd = CustomVaspChargeDensity(tmppath)
-    os.remove(tmppath)
+    try:
+        vcd = CustomVaspChargeDensity(tmppath)
+    finally:
+        os.remove(tmppath)  # always clean up, even if parsing fails
     vcd.chg = [cd]
     vcd.atoms = [atoms]
     vcd.write(filename, format='chgcar')
