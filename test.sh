@@ -2,7 +2,7 @@
 #SBATCH --job-name=electra_MM
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=s234633@dtu.dk  # The default value is the submitting user.
-#SBATCH --partition=sm3090el8,sm3090el9,sm3090el9_768,a100_week
+#SBATCH --partition=sm3090el9,sm3090el9_768
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --time=07-00:00:00
@@ -11,6 +11,9 @@
 #SBATCH --mem-per-cpu=12G
 
 #SBATCH --output=logs7/electra_MM_%j.log
+
+# Resume mpfull 100% density, seed 202, from lyric-valley-497 (14 epochs done).
+# Submit from /home/energy/s234633/ELECTRA so logs7/ resolves correctly.
 
 # ---- Per-run settings ------------------------------------------------------
 # Slurm stores a copy of this script when you submit it, so changing these
@@ -23,11 +26,11 @@ lr_id='normal'
 INITIAL_LR=4e-6
 FINAL_LR=4e-6
 DATA_SPLIT=mpfull2025
-LOAD_MODEL_PATH=              # set a path to load a checkpoint; empty = train from scratch
-USE_FRACTION_OF_DENSITY=true # true | false (train2.py only)
-DENSITY_FRACTION=0.1
-INDICES_FOR_DENSITY=indices_10pct.json
-       # e.g. /home/energy/s234633/ELECTRA/data_splits/density_indices/indices_1pct.json
+LOAD_MODEL_PATH="/home/scratch3/s234633/ELECTRA/trained_models/ELECTRA_2026-11-21_mt_mpfull_dens100%_lr_normal_seed202_prev12ep_lyric-valley-497.model_state_dict"
+USE_FRACTION_OF_DENSITY=false
+DENSITY_FRACTION=1
+#INDICES_FOR_DENSITY=indices_10pct.json
+PREV_EPOCHS=14                 # epochs finished by the run being resumed (adds prev<N>ep to the run name)
 # ----------------------------------------------------------------------------
 
 ARGS=()
@@ -45,6 +48,7 @@ fi
 [ "$USE_FRACTION_OF_DENSITY" = false ] && ARGS+=(--no_use_fraction_of_density)
 [ -n "$DENSITY_FRACTION" ]    && ARGS+=(--density_fraction "$DENSITY_FRACTION")
 [ -n "$INDICES_FOR_DENSITY" ] && ARGS+=(--indices_for_density "$INDICES_FOR_DENSITY")
+[ -n "$PREV_EPOCHS" ]         && ARGS+=(--prev_epochs "$PREV_EPOCHS")
 
 # ---- Sibling copies (only for jobs queued with submit.sh) -------------------
 # submit.sh queues a 7-day and a 2-day copy under the same PAIR_TAG. The first
@@ -73,6 +77,9 @@ conda activate electra_env
 # Don't let wandb copy stdout into output.log/.wandb; the Slurm log still has it.
 export WANDB_CONSOLE=off
 
+# Validation CHGCAR/delta/HTML outputs go to scratch3, not /home/energy.
+export ELECTRA_OUTPUT_BASE=/home/scratch3/s234633/ELECTRA/
+
 # Keep wandb's local run files on the node's own disk, not /home/energy. Heavy
 # I/O on the group fileserver gets jobs killed. Metrics still sync to wandb.ai;
 # the local copy is moved to scratch3 when the job ends.
@@ -81,5 +88,4 @@ mkdir -p "$WANDB_DIR"
 trap 'mkdir -p /home/scratch3/s234633/ELECTRA/wandb_runs && cp -r "$WANDB_DIR"/wandb/* /home/scratch3/s234633/ELECTRA/wandb_runs/ 2>/dev/null; rm -rf "$WANDB_DIR"' EXIT
 
 echo "Running $SCRIPT ${ARGS[*]}"
-#python3 /home/energy/s234633/ELECTRA/train_frozen_mlp.py --config /home/energy/s234633/ELECTRA/hpc_conf_frozen.yaml --feature_cache /home/energy/s234633/ELECTRA/frozen_features_with_density.pt --epochs 20
 python3 /home/energy/s234633/ELECTRA/$SCRIPT "${ARGS[@]}"
